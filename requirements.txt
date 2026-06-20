@@ -1,0 +1,24 @@
+# SmartModel AI — Requirements
+# Install: pip install -r requirements.txt
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+joblib>=1.3.0
+openpyxl>=3.1.0          # Excel support
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+plotly>=5.18.0
+
+# ── Reports ───────────────────────────────────────────────────────────────────
+reportlab>=4.0.0
+
+# ── Boosting libraries (optional but recommended) ────────────────────────────
+xgboost>=2.0.0
+lightgbm>=4.0.0
+# catboost>=1.2.0         # Uncomment if needed (large install)
+
+# ── Scipy (for outlier detection) ────────────────────────────────────────────
+scipy>=1.12.0
