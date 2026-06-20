@@ -21,7 +21,7 @@ from plotly.subplots import make_subplots
 
 # ── Scikit-Learn ──────────────────────────────────────────────────────────────
 from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV, cross_val_score
-from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler, RobustScaler, OneHotEncoder, PolynomialFeatures
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
@@ -34,6 +34,7 @@ from sklearn.ensemble import (
     RandomForestClassifier, RandomForestRegressor,
     ExtraTreesClassifier, ExtraTreesRegressor,
     GradientBoostingClassifier, GradientBoostingRegressor,
+    HistGradientBoostingClassifier, HistGradientBoostingRegressor,
     StackingClassifier, StackingRegressor,
     VotingClassifier, VotingRegressor,
 )
@@ -532,9 +533,12 @@ def clean_dataframe(
     remove_dups: bool = True,
     fill_strategy: str = "median",
     encode_cats: bool = True,
+    encoding_method: str = "label",
     scale: str = "standard",
     drop_outliers: bool = False,
+    outlier_method: str = "zscore",
     outlier_z: float = 3.0,
+    feature_engineering: str = "none",
 ) -> Tuple[pd.DataFrame, List[str]]:
     log = []
     df = df.copy()
@@ -567,25 +571,76 @@ def clean_dataframe(
             log.append(f"Filled '{c}' NaN → mode")
 
     if drop_outliers and num_cols:
-        from scipy import stats as sp_stats
-        mask = np.ones(len(df), dtype=bool)
-        for c in num_cols:
-            z = np.abs(sp_stats.zscore(df[c], nan_policy="omit"))
-            mask &= (z <= outlier_z)
-        removed = (~mask).sum()
-        df = df[mask]
-        if removed: log.append(f"Removed {removed:,} outlier rows (|Z|>{outlier_z})")
+        if outlier_method == "iqr":
+            mask = np.ones(len(df), dtype=bool)
+            for c in num_cols:
+                q1, q3 = df[c].quantile(0.25), df[c].quantile(0.75)
+                iqr = q3 - q1
+                lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                mask &= df[c].between(lo, hi) | df[c].isna()
+            removed = (~mask).sum()
+            df = df[mask]
+            if removed: log.append(f"Removed {removed:,} outlier rows (IQR method, 1.5×IQR)")
+        else:
+            from scipy import stats as sp_stats
+            mask = np.ones(len(df), dtype=bool)
+            for c in num_cols:
+                z = np.abs(sp_stats.zscore(df[c], nan_policy="omit"))
+                mask &= (z <= outlier_z)
+            removed = (~mask).sum()
+            df = df[mask]
+            if removed: log.append(f"Removed {removed:,} outlier rows (|Z|>{outlier_z})")
 
     if encode_cats:
-        for c in list(cat_cols):
-            if c not in df.columns: continue
-            if df[c].nunique() <= 50:
-                le = LabelEncoder()
-                df[c] = le.fit_transform(df[c].astype(str))
-                log.append(f"Label-encoded '{c}' ({df[c].nunique()} classes)")
-            else:
-                df = df.drop(columns=[c])
-                log.append(f"Dropped high-cardinality column '{c}'")
+        if encoding_method == "onehot":
+            for c in list(cat_cols):
+                if c not in df.columns: continue
+                nun = df[c].nunique()
+                if nun <= 50:
+                    if nun <= 2:
+                        # Binary categorical: keep as a single label-encoded column
+                        le = LabelEncoder()
+                        df[c] = le.fit_transform(df[c].astype(str))
+                        log.append(f"Label-encoded binary column '{c}'")
+                    else:
+                        dummies = pd.get_dummies(df[c].astype(str), prefix=c, dtype=int)
+                        df = pd.concat([df.drop(columns=[c]), dummies], axis=1)
+                        log.append(f"One-hot encoded '{c}' ({dummies.shape[1]} new columns)")
+                else:
+                    df = df.drop(columns=[c])
+                    log.append(f"Dropped high-cardinality column '{c}'")
+        else:
+            for c in list(cat_cols):
+                if c not in df.columns: continue
+                if df[c].nunique() <= 50:
+                    le = LabelEncoder()
+                    df[c] = le.fit_transform(df[c].astype(str))
+                    log.append(f"Label-encoded '{c}' ({df[c].nunique()} classes)")
+                else:
+                    df = df.drop(columns=[c])
+                    log.append(f"Dropped high-cardinality column '{c}'")
+
+    cur_num = df.select_dtypes(include=np.number).columns.tolist()
+
+    if feature_engineering != "none" and cur_num:
+        # Cap the base column count so we don't explode dimensionality
+        base_cols = cur_num[:8]
+        if feature_engineering == "interactions":
+            poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+            arr = poly.fit_transform(df[base_cols])
+            new_names = poly.get_feature_names_out(base_cols)
+            added = [n for n in new_names if n not in base_cols]
+            poly_df = pd.DataFrame(arr, columns=new_names, index=df.index)[added]
+            df = pd.concat([df, poly_df], axis=1)
+            log.append(f"Added {len(added)} interaction features (pairwise products of {len(base_cols)} columns)")
+        elif feature_engineering == "polynomial":
+            poly = PolynomialFeatures(degree=2, interaction_only=False, include_bias=False)
+            arr = poly.fit_transform(df[base_cols])
+            new_names = poly.get_feature_names_out(base_cols)
+            added = [n for n in new_names if n not in base_cols]
+            poly_df = pd.DataFrame(arr, columns=new_names, index=df.index)[added]
+            df = pd.concat([df, poly_df], axis=1)
+            log.append(f"Added {len(added)} polynomial features (degree 2, incl. squares) from {len(base_cols)} columns")
 
     cur_num = df.select_dtypes(include=np.number).columns.tolist()
     if scale != "none" and cur_num:
@@ -608,6 +663,7 @@ def get_clf_models(class_weight=None) -> Dict[str, Any]:
         "Random Forest":        RandomForestClassifier(n_estimators=150, random_state=42, class_weight=cw, n_jobs=-1),
         "Extra Trees":          ExtraTreesClassifier(n_estimators=150, random_state=42, class_weight=cw, n_jobs=-1),
         "Gradient Boosting":    GradientBoostingClassifier(n_estimators=150, random_state=42, subsample=0.8),
+        "Hist Gradient Boosting": HistGradientBoostingClassifier(max_iter=150, random_state=42, class_weight=cw),
         "KNN":                  KNeighborsClassifier(n_neighbors=7, metric="euclidean"),
         "SVM":                  CalibratedClassifierCV(SVC(kernel="rbf", random_state=42, class_weight=cw), cv=3),
     }
@@ -637,6 +693,7 @@ def get_reg_models() -> Dict[str, Any]:
         "Random Forest":       RandomForestRegressor(n_estimators=150, random_state=42, n_jobs=-1),
         "Extra Trees":         ExtraTreesRegressor(n_estimators=150, random_state=42, n_jobs=-1),
         "Gradient Boosting":   GradientBoostingRegressor(n_estimators=150, random_state=42, subsample=0.8),
+        "Hist Gradient Boosting": HistGradientBoostingRegressor(max_iter=150, random_state=42),
         "SVR":                 SVR(kernel="rbf", C=1.0, epsilon=0.1),
     }
     if HAS_XGB:
@@ -682,6 +739,7 @@ CLF_SPACES = {
     "Random Forest":       {"n_estimators":[100,200,300],"max_depth":[None,5,10,20],"min_samples_split":[2,5,10],"max_features":["sqrt","log2"]},
     "Extra Trees":         {"n_estimators":[100,200,300],"max_depth":[None,5,10,20],"min_samples_split":[2,5,10]},
     "Gradient Boosting":   {"n_estimators":[100,200,300],"max_depth":[3,5,7],"learning_rate":[.01,.05,.1],"subsample":[.7,.8,1.0]},
+    "Hist Gradient Boosting": {"max_iter":[100,150,200,300],"max_depth":[None,5,10,20],"learning_rate":[.01,.05,.1,.2],"l2_regularization":[0,.1,1.0]},
     "XGBoost":             {"n_estimators":[100,200,300],"max_depth":[3,5,7],"learning_rate":[.01,.05,.1,.2],"subsample":[.7,.8,1.0],"colsample_bytree":[.6,.8,1.0],"min_child_weight":[1,3,5]},
     "LightGBM":            {"n_estimators":[100,200,300],"max_depth":[-1,5,10],"learning_rate":[.01,.05,.1,.2],"num_leaves":[31,63,127],"subsample":[.7,.8,1.0]},
     "KNN":                 {"n_neighbors":[3,5,7,11,15],"weights":["uniform","distance"],"metric":["euclidean","manhattan"]},
@@ -693,6 +751,7 @@ REG_SPACES = {
     "Random Forest":       {"n_estimators":[100,200,300],"max_depth":[None,5,10,20],"min_samples_split":[2,5,10],"max_features":["sqrt","log2"]},
     "Extra Trees":         {"n_estimators":[100,200,300],"max_depth":[None,5,10,20],"min_samples_split":[2,5,10]},
     "Gradient Boosting":   {"n_estimators":[100,200,300],"max_depth":[3,5,7],"learning_rate":[.01,.05,.1],"subsample":[.7,.8,1.0]},
+    "Hist Gradient Boosting": {"max_iter":[100,150,200,300],"max_depth":[None,5,10,20],"learning_rate":[.01,.05,.1,.2],"l2_regularization":[0,.1,1.0]},
     "XGBoost":             {"n_estimators":[100,200,300],"max_depth":[3,5,7],"learning_rate":[.01,.05,.1,.2],"subsample":[.7,.8,1.0],"colsample_bytree":[.6,.8,1.0]},
     "LightGBM":            {"n_estimators":[100,200,300],"max_depth":[-1,5,10],"learning_rate":[.01,.05,.1,.2],"num_leaves":[31,63,127]},
     "KNN Regressor":       {"n_neighbors":[3,5,7,11,15],"weights":["uniform","distance"]},
@@ -1410,11 +1469,22 @@ elif page == "Train Model":
             with c1:
                 remove_dups   = st.checkbox("Remove duplicate rows", value=True)
                 encode_cats   = st.checkbox("Encode categorical columns", value=True)
-                drop_outliers = st.checkbox("Remove outliers (Z-score method)", value=False)
+                encoding_method = st.selectbox("Encoding method", ["label","onehot"],
+                                               help="'label' assigns each category an integer. 'onehot' creates a binary column per category (better for non-ordinal categories, skipped for 2-class columns).")
+                drop_outliers = st.checkbox("Remove outliers", value=False)
+                outlier_method = st.selectbox("Outlier detection method", ["zscore","iqr"],
+                                              help="'zscore' flags points beyond N standard deviations. 'iqr' flags points beyond 1.5× the interquartile range — more robust to skewed data.")
             with c2:
                 fill_strategy = st.selectbox("Fill missing values strategy", ["median","mean","zero","drop"])
                 scale         = st.selectbox("Feature scaling", ["standard","minmax","robust","none"])
-                outlier_z     = st.slider("Z-score threshold for outliers", 2.0, 5.0, 3.0, 0.5)
+                outlier_z     = st.slider("Z-score threshold for outliers", 2.0, 5.0, 3.0, 0.5,
+                                          help="Only used when outlier method is 'zscore'.")
+                feature_engineering = st.selectbox(
+                    "Feature engineering", ["none","interactions","polynomial"],
+                    help="'interactions' adds pairwise products of numeric columns (A×B). "
+                         "'polynomial' additionally adds squared terms (A², B²). "
+                         "Applied to up to the first 8 numeric columns to limit dimensionality."
+                )
 
             apply_btn = st.form_submit_button("🧹  Apply Cleaning Pipeline", use_container_width=True)
 
@@ -1422,8 +1492,9 @@ elif page == "Train Model":
             with st.spinner("Running cleaning pipeline…"):
                 df_clean, log = clean_dataframe(
                     df_raw, remove_dups=remove_dups, fill_strategy=fill_strategy,
-                    encode_cats=encode_cats, scale=scale,
-                    drop_outliers=drop_outliers, outlier_z=outlier_z,
+                    encode_cats=encode_cats, encoding_method=encoding_method, scale=scale,
+                    drop_outliers=drop_outliers, outlier_method=outlier_method, outlier_z=outlier_z,
+                    feature_engineering=feature_engineering,
                 )
             st.session_state.df_clean   = df_clean
             st.session_state.cleaning_log = log
@@ -1484,11 +1555,10 @@ elif page == "Train Model":
                 st.markdown("""
                 <div style="font-size:.78rem;color:var(--text-muted);margin-top:.3rem;line-height:1.8">
                   ℹ️ <b>New in this version</b><br>
-                  • F1-weighted as primary score<br>
-                  • Balanced Accuracy + MCC metrics<br>
-                  • Multiclass ROC-AUC (OvR)<br>
-                  • Auto class-imbalance detection<br>
-                  • ElasticNet + KNN Regressor added<br>
+                  • One-hot encoding option<br>
+                  • IQR-based outlier detection<br>
+                  • Feature engineering (interactions/polynomial)<br>
+                  • Hist Gradient Boosting model<br>
                   • Stacking Ensemble model
                 </div>""", unsafe_allow_html=True)
 
