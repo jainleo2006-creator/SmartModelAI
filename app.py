@@ -455,10 +455,47 @@ def fmt_num(n) -> str:
     except Exception:
         return str(n)
 
+@st.cache_data(show_spinner=False)
+def parse_uploaded_file(file_bytes: bytes, ext: str) -> pd.DataFrame:
+    """Parse uploaded CSV/Excel bytes into a DataFrame. Cached on file content so
+    re-running the script (e.g. switching tabs) doesn't re-parse unchanged files."""
+    buf = io.BytesIO(file_bytes)
+    return pd.read_csv(buf) if ext == ".csv" else pd.read_excel(buf)
+
 def infer_problem(series: pd.Series) -> str:
     if series.dtype == object or series.nunique() <= 20:
         return "Classification"
     return "Regression"
+
+@st.cache_data(show_spinner=False)
+def compute_overview_stats(df: pd.DataFrame):
+    """Expensive, pure dataframe summaries — cached so they don't recompute on every rerun."""
+    info = pd.DataFrame({
+        "Column": df.columns,
+        "Type": df.dtypes.astype(str).values,
+        "Non-Null": df.count().values,
+        "Null": df.isnull().sum().values,
+        "Unique": df.nunique().values,
+    })
+    describe = df.describe(include="all").T
+    return info, describe
+
+@st.cache_data(show_spinner=False)
+def compute_missing_summary(df: pd.DataFrame):
+    miss = df.isnull().sum().reset_index()
+    miss.columns = ["Column", "Missing"]
+    return miss[miss["Missing"] > 0].sort_values("Missing", ascending=False)
+
+@st.cache_data(show_spinner=False)
+def compute_basic_stats(df: pd.DataFrame):
+    """Rows/cols/missing/duplicates/memory — cached since they scan the full dataframe."""
+    return {
+        "rows": df.shape[0],
+        "cols": df.shape[1],
+        "missing": int(df.isnull().sum().sum()),
+        "duplicates": int(df.duplicated().sum()),
+        "memory_mb": df.memory_usage(deep=True).sum() / 1e6,
+    }
 
 def badge(text: str, kind: str = "clf") -> str:
     return f'<span class="badge badge-{kind}">{text}</span>'
@@ -657,41 +694,48 @@ def clean_dataframe(
 # ══════════════════════════════════════════════════════════════════════════════
 def get_clf_models(class_weight=None) -> Dict[str, Any]:
     cw = class_weight  # None or "balanced"
+    # NOTE: n_jobs=1 on individual estimators here — parallelism is applied at the
+    # outer cross_val_score/GridSearchCV level instead. Setting n_jobs=-1 on both
+    # layers oversubscribes CPU cores and slows things down rather than speeding
+    # them up.
     models = {
         "Logistic Regression":  LogisticRegression(max_iter=1000, random_state=42, class_weight=cw, solver="lbfgs"),
         "Decision Tree":        DecisionTreeClassifier(random_state=42, class_weight=cw, max_depth=10),
-        "Random Forest":        RandomForestClassifier(n_estimators=150, random_state=42, class_weight=cw, n_jobs=-1),
-        "Extra Trees":          ExtraTreesClassifier(n_estimators=150, random_state=42, class_weight=cw, n_jobs=-1),
+        "Random Forest":        RandomForestClassifier(n_estimators=150, random_state=42, class_weight=cw, n_jobs=1),
+        "Extra Trees":          ExtraTreesClassifier(n_estimators=150, random_state=42, class_weight=cw, n_jobs=1),
         "Gradient Boosting":    GradientBoostingClassifier(n_estimators=150, random_state=42, subsample=0.8),
         "Hist Gradient Boosting": HistGradientBoostingClassifier(max_iter=150, random_state=42, class_weight=cw),
-        "KNN":                  KNeighborsClassifier(n_neighbors=7, metric="euclidean"),
+        "KNN":                  KNeighborsClassifier(n_neighbors=7, metric="euclidean", n_jobs=1),
         "SVM":                  CalibratedClassifierCV(SVC(kernel="rbf", random_state=42, class_weight=cw), cv=3),
     }
     if HAS_XGB:
         models["XGBoost"] = XGBClassifier(
             n_estimators=150, random_state=42, eval_metric="logloss", verbosity=0,
             subsample=0.8, colsample_bytree=0.8, learning_rate=0.05, use_label_encoder=False,
+            n_jobs=1,
         )
     if HAS_LGB:
         models["LightGBM"] = LGBMClassifier(
             n_estimators=150, random_state=42, verbose=-1,
             subsample=0.8, colsample_bytree=0.8, learning_rate=0.05,
-            class_weight=cw,
+            class_weight=cw, n_jobs=1,
         )
     if HAS_CAT:
         models["CatBoost"] = CatBoostClassifier(iterations=150, random_state=42, verbose=0, learning_rate=0.05)
     return models
 
 def get_reg_models() -> Dict[str, Any]:
+    # n_jobs=1 on individual estimators — parallelism applied at the outer
+    # cross_val_score/GridSearchCV level to avoid oversubscribing CPU cores.
     models = {
         "Linear Regression":   LinearRegression(),
         "Ridge":               Ridge(alpha=1.0),
         "Lasso":               Lasso(alpha=0.1, max_iter=10000),
         "ElasticNet":          ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=10000),
-        "KNN Regressor":       KNeighborsRegressor(n_neighbors=7, metric="euclidean"),
+        "KNN Regressor":       KNeighborsRegressor(n_neighbors=7, metric="euclidean", n_jobs=1),
         "Decision Tree":       DecisionTreeRegressor(random_state=42, max_depth=10),
-        "Random Forest":       RandomForestRegressor(n_estimators=150, random_state=42, n_jobs=-1),
-        "Extra Trees":         ExtraTreesRegressor(n_estimators=150, random_state=42, n_jobs=-1),
+        "Random Forest":       RandomForestRegressor(n_estimators=150, random_state=42, n_jobs=1),
+        "Extra Trees":         ExtraTreesRegressor(n_estimators=150, random_state=42, n_jobs=1),
         "Gradient Boosting":   GradientBoostingRegressor(n_estimators=150, random_state=42, subsample=0.8),
         "Hist Gradient Boosting": HistGradientBoostingRegressor(max_iter=150, random_state=42),
         "SVR":                 SVR(kernel="rbf", C=1.0, epsilon=0.1),
@@ -700,37 +744,41 @@ def get_reg_models() -> Dict[str, Any]:
         models["XGBoost"] = XGBRegressor(
             n_estimators=150, random_state=42, verbosity=0,
             subsample=0.8, colsample_bytree=0.8, learning_rate=0.05,
+            n_jobs=1,
         )
     if HAS_LGB:
         models["LightGBM"] = LGBMRegressor(
             n_estimators=150, random_state=42, verbose=-1,
             subsample=0.8, colsample_bytree=0.8, learning_rate=0.05,
+            n_jobs=1,
         )
     if HAS_CAT:
         models["CatBoost"] = CatBoostRegressor(iterations=150, random_state=42, verbose=0, learning_rate=0.05)
     return models
 
 def build_stacking_clf(class_weight=None):
-    """Build a stacking ensemble from top base learners."""
+    """Build a stacking ensemble from top base learners.
+    Inner estimators use n_jobs=1 since StackingClassifier(n_jobs=-1) already
+    parallelizes across base learners — stacking both layers oversubscribes cores."""
     estimators = [
-        ("rf",  RandomForestClassifier(n_estimators=100, random_state=42, class_weight=class_weight, n_jobs=-1)),
-        ("et",  ExtraTreesClassifier(n_estimators=100, random_state=42, class_weight=class_weight, n_jobs=-1)),
+        ("rf",  RandomForestClassifier(n_estimators=100, random_state=42, class_weight=class_weight, n_jobs=1)),
+        ("et",  ExtraTreesClassifier(n_estimators=100, random_state=42, class_weight=class_weight, n_jobs=1)),
         ("gb",  GradientBoostingClassifier(n_estimators=100, random_state=42)),
     ]
     if HAS_XGB:
-        estimators.append(("xgb", XGBClassifier(n_estimators=100, random_state=42, verbosity=0, eval_metric="logloss")))
+        estimators.append(("xgb", XGBClassifier(n_estimators=100, random_state=42, verbosity=0, eval_metric="logloss", n_jobs=1)))
     meta = LogisticRegression(max_iter=500, random_state=42, class_weight=class_weight)
     return StackingClassifier(estimators=estimators, final_estimator=meta, cv=3, n_jobs=-1, passthrough=False)
 
 def build_stacking_reg():
-    """Build a stacking ensemble for regression."""
+    """Build a stacking ensemble for regression. See build_stacking_clf for n_jobs rationale."""
     estimators = [
-        ("rf",  RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)),
-        ("et",  ExtraTreesRegressor(n_estimators=100, random_state=42, n_jobs=-1)),
+        ("rf",  RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=1)),
+        ("et",  ExtraTreesRegressor(n_estimators=100, random_state=42, n_jobs=1)),
         ("gb",  GradientBoostingRegressor(n_estimators=100, random_state=42)),
     ]
     if HAS_XGB:
-        estimators.append(("xgb", XGBRegressor(n_estimators=100, random_state=42, verbosity=0)))
+        estimators.append(("xgb", XGBRegressor(n_estimators=100, random_state=42, verbosity=0, n_jobs=1)))
     meta = Ridge(alpha=1.0)
     return StackingRegressor(estimators=estimators, final_estimator=meta, cv=3, n_jobs=-1, passthrough=False)
 
@@ -810,8 +858,10 @@ def run_automl(
         t0 = time.time()
         try:
             # ── Hyperparameter tuning ────────────────────────────────────────
+            search_cv = 3
+            searcher = None
             if tune_mode != "none" and name in spaces:
-                kwargs = dict(cv=3, scoring=clf_scoring, n_jobs=-1, error_score=0)
+                kwargs = dict(cv=search_cv, scoring=clf_scoring, n_jobs=-1, error_score=0)
                 if tune_mode == "random":
                     searcher = RandomizedSearchCV(model, spaces[name], n_iter=15, random_state=42, **kwargs)
                 else:
@@ -827,13 +877,24 @@ def run_automl(
             y_pred  = model.predict(X_test)
 
             # ── Cross-validation score ───────────────────────────────────────
-            try:
-                cv_sc = cross_val_score(model, X_train, y_train, cv=cv_folds,
-                                        scoring=clf_scoring, n_jobs=-1, error_score=0)
-                cv_mean = round(float(cv_sc.mean()), 4)
-                cv_std  = round(float(cv_sc.std()), 4)
-            except Exception:
-                cv_mean, cv_std = None, None
+            # If the search already ran CV with the same fold count the caller asked
+            # for, reuse its results instead of retraining the model from scratch
+            # again via a fresh cross_val_score pass — searcher.cv_results_ already
+            # has the per-fold scores for the winning hyperparameter combination.
+            if searcher is not None and search_cv == cv_folds:
+                best_idx = searcher.best_index_
+                cv_res = searcher.cv_results_
+                split_scores = [cv_res[f"split{k}_test_score"][best_idx] for k in range(search_cv)]
+                cv_mean = round(float(np.mean(split_scores)), 4)
+                cv_std  = round(float(np.std(split_scores)), 4)
+            else:
+                try:
+                    cv_sc = cross_val_score(model, X_train, y_train, cv=cv_folds,
+                                            scoring=clf_scoring, n_jobs=-1, error_score=0)
+                    cv_mean = round(float(cv_sc.mean()), 4)
+                    cv_std  = round(float(cv_sc.std()), 4)
+                except Exception:
+                    cv_mean, cv_std = None, None
 
             row = {"Model": name, "Time(s)": elapsed,
                    "CV Score": cv_mean, "CV Std": cv_std,
@@ -987,10 +1048,15 @@ def chart_leaderboard_bar(results: List[Dict], problem: str):
     fig.update_xaxes(title=label)
     return plotly_dark(fig, "Model Leaderboard")
 
-def chart_correlation(df: pd.DataFrame):
+@st.cache_data(show_spinner=False)
+def compute_correlation(df: pd.DataFrame):
     num = df.select_dtypes(include=np.number)
     if num.shape[1] < 2: return None
-    corr = num.corr()
+    return num.corr()
+
+def chart_correlation(df: pd.DataFrame):
+    corr = compute_correlation(df)
+    if corr is None: return None
     fig = px.imshow(corr, color_continuous_scale="RdBu", zmin=-1, zmax=1, text_auto=".2f")
     return plotly_dark(fig, "Correlation Matrix")
 
@@ -1265,28 +1331,37 @@ elif page == "Upload Dataset":
 
     if uploaded:
         try:
-            ext = Path(uploaded.name).suffix.lower()
-            with st.spinner("Reading file…"):
-                df = pd.read_csv(uploaded) if ext == ".csv" else pd.read_excel(uploaded)
+            # Only re-parse and reset session state if this is actually a new/changed file —
+            # otherwise every rerun (e.g. clicking any button on this page) would re-read the
+            # whole file from bytes and silently wipe any trained model already in session.
+            is_new_file = st.session_state.df_source != uploaded.name
+            if is_new_file:
+                ext = Path(uploaded.name).suffix.lower()
+                with st.spinner("Reading file…"):
+                    df = parse_uploaded_file(uploaded.getvalue(), ext)
 
-            st.session_state.df_raw    = df
-            st.session_state.df_clean  = None
-            st.session_state.df_source = uploaded.name
-            st.session_state.results   = []
-            st.session_state.best_model = None
-            st.session_state.best_model_name = ""
-            st.session_state.feature_cols = []
-            st.session_state.target_col = None
+                st.session_state.df_raw    = df
+                st.session_state.df_clean  = None
+                st.session_state.df_source = uploaded.name
+                st.session_state.results   = []
+                st.session_state.best_model = None
+                st.session_state.best_model_name = ""
+                st.session_state.feature_cols = []
+                st.session_state.target_col = None
 
-            st.success(f"✓  Loaded **{uploaded.name}** successfully")
+                st.success(f"✓  Loaded **{uploaded.name}** successfully")
+            else:
+                df = st.session_state.df_raw
+                st.info(f"ℹ  **{uploaded.name}** is already loaded.")
 
             # Stats
+            stats = compute_basic_stats(df)
             c1,c2,c3,c4,c5 = st.columns(5)
-            with c1: sm_card("Rows", fmt_num(df.shape[0]))
-            with c2: sm_card("Columns", str(df.shape[1]))
-            with c3: sm_card("Missing Values", str(df.isnull().sum().sum()), color="var(--accent-warn)")
-            with c4: sm_card("Duplicates", str(df.duplicated().sum()), color="var(--accent-warn)")
-            with c5: sm_card("Memory", f"{df.memory_usage(deep=True).sum()/1e6:.1f} MB")
+            with c1: sm_card("Rows", fmt_num(stats["rows"]))
+            with c2: sm_card("Columns", str(stats["cols"]))
+            with c3: sm_card("Missing Values", str(stats["missing"]), color="var(--accent-warn)")
+            with c4: sm_card("Duplicates", str(stats["duplicates"]), color="var(--accent-warn)")
+            with c5: sm_card("Memory", f"{stats['memory_mb']:.1f} MB")
 
             divider()
 
@@ -1372,12 +1447,13 @@ elif page == "Train Model":
     # ── TAB: DATA ANALYSIS ──
     with tab_analysis:
         st.markdown("<br>", unsafe_allow_html=True)
+        stats = compute_basic_stats(df_raw)
         c1,c2,c3,c4,c5 = st.columns(5)
-        with c1: sm_card("Rows", fmt_num(df_raw.shape[0]))
-        with c2: sm_card("Columns", str(df_raw.shape[1]))
-        with c3: sm_card("Missing", str(df_raw.isnull().sum().sum()), color="var(--accent-warn)")
-        with c4: sm_card("Duplicates", str(df_raw.duplicated().sum()), color="var(--accent-warn)")
-        with c5: sm_card("Memory", f"{df_raw.memory_usage(deep=True).sum()/1e6:.1f} MB")
+        with c1: sm_card("Rows", fmt_num(stats["rows"]))
+        with c2: sm_card("Columns", str(stats["cols"]))
+        with c3: sm_card("Missing", str(stats["missing"]), color="var(--accent-warn)")
+        with c4: sm_card("Duplicates", str(stats["duplicates"]), color="var(--accent-warn)")
+        with c5: sm_card("Memory", f"{stats['memory_mb']:.1f} MB")
 
         inner1, inner2, inner3, inner4, inner5 = st.tabs(
             ["Overview","Missing Values","Correlation","Distributions","Target Analysis"])
@@ -1385,21 +1461,13 @@ elif page == "Train Model":
         with inner1:
             st.dataframe(df_raw.head(30), use_container_width=True, hide_index=True)
             divider()
-            info = pd.DataFrame({
-                "Column": df_raw.columns,
-                "Type": df_raw.dtypes.astype(str).values,
-                "Non-Null": df_raw.count().values,
-                "Null": df_raw.isnull().sum().values,
-                "Unique": df_raw.nunique().values,
-            })
+            info, describe = compute_overview_stats(df_raw)
             st.dataframe(info, use_container_width=True, hide_index=True)
             divider()
-            st.dataframe(df_raw.describe(include="all").T, use_container_width=True)
+            st.dataframe(describe, use_container_width=True)
 
         with inner2:
-            miss = df_raw.isnull().sum().reset_index()
-            miss.columns = ["Column","Missing"]
-            miss = miss[miss["Missing"] > 0].sort_values("Missing", ascending=False)
+            miss = compute_missing_summary(df_raw)
             if miss.empty:
                 st.success("✓  No missing values — dataset is complete.")
             else:
