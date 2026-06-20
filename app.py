@@ -1387,7 +1387,7 @@ elif page == "Train Model":
             divider()
             info = pd.DataFrame({
                 "Column": df_raw.columns,
-                "Type": df_raw.dtypes.values,
+                "Type": df_raw.dtypes.astype(str).values,
                 "Non-Null": df_raw.count().values,
                 "Null": df_raw.isnull().sum().values,
                 "Unique": df_raw.nunique().values,
@@ -1440,7 +1440,7 @@ elif page == "Train Model":
                                                 color_discrete_sequence=["#2d7dd2"], height=200)
                             plotly_dark(fig2, cname)
                             fig2.update_layout(margin=dict(l=5,r=5,t=35,b=5), showlegend=False, title_font_size=11)
-                            st.plotly_chart(fig2, use_container_width=True)
+                            st.plotly_chart(fig2, use_container_width=True, key=f"numeric_overview_{cname}")
 
         with inner5:
             target_sel = st.selectbox("Select target column", df_raw.columns.tolist(), key="target_analysis")
@@ -1451,7 +1451,7 @@ elif page == "Train Model":
                 dc1, dc2 = st.columns(2)
                 with dc1:
                     fig = chart_distribution(df_raw[target_sel], target_sel)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"target_dist_{target_sel}")
                 with dc2:
                     vc = df_raw[target_sel].value_counts().reset_index()
                     vc.columns = [target_sel, "count"]
